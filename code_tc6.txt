@@ -1,0 +1,315 @@
+// ============================================================================
+// TC6: Constrained-Random Stimulus  (REVISED)
+//
+// Thay đổi chính so với bản gốc:
+//   (1) Vòng lặp body() đếm theo SỐ HÀNH ĐỘNG (NUM_ACTIONS), không đếm cycle.
+//       Bỏ luôn @(posedge clk) ở đầu vòng — mỗi action đã tự đợi clock của nó.
+//   (2) Thêm cơ chế nhớ pointer cục bộ (pred_tail_idx / pred_head_idx) +
+//       số vòng wrap (dispatch_rounds / commit_rounds).
+//       - dispatch ⇒ pred_tail_idx tiến CW entries, wrap quanh NUM_ROB_ENTRIES.
+//       - mispredict ⇒ pred_tail_idx snap về (br_row+1)*CW, wrap nếu cần.
+//       - flush exception (vif.flush_valid) ⇒ pred_*_idx reset về 0.
+//       - Mỗi action xong: gọi sync_pointers_from_dut() để cross-check
+//         giá trị dự đoán với rob_*_idx thực, log nếu drift.
+//       Nhờ đó test KHÔNG còn giả định "WB hết = pointer về 0" nữa.
+// ============================================================================
+class tc6_random_seq extends uvm_sequence #(rob_transaction);
+  `uvm_object_utils(tc6_random_seq)
+
+  virtual rob_if.MON vif;
+  rob_driver         drv;
+
+  // ---- Config -------------------------------------------------------------
+  int unsigned NUM_ACTIONS = 500;            // ĐẾM HÀNH ĐỘNG (req #1)
+  int unsigned MAX_ROB_IDX = NUM_ROB_ENTRIES; // = 96 với CW=4, ROWS=24
+
+  // ---- Tracking pointer cục bộ (req #2) ----------------------------------
+  bit [6:0]    pred_tail_idx = 0;   // dự đoán rob_tail_idx (full index)
+  bit [6:0]    pred_head_idx = 0;   // dự đoán rob_head_idx (full index)
+  int unsigned dispatch_rounds = 0; // số lần tail wrap quanh ROB
+  int unsigned commit_rounds   = 0; // số lần head wrap quanh ROB
+
+  // ---- In-flight bookkeeping ---------------------------------------------
+  bit [6:0] dispatched_idx[$];
+  bit [6:0] dispatched_pdst[128];
+  int       ftq = 0;
+  int       cycle_since_last_dispatch = 0;
+
+  function new(string name="tc6_random_seq"); super.new(name); endfunction
+
+  // -----------------------------------------------------------------------
+  // Helper: tăng pointer 1 row (CW entries) với wrap quanh MAX_ROB_IDX
+  // -----------------------------------------------------------------------
+  function automatic bit [6:0] wrap_inc_row_tail(bit [6:0] idx);
+    bit [6:0] nxt = idx + CW;
+    if (nxt >= MAX_ROB_IDX) begin
+      nxt = nxt - MAX_ROB_IDX;
+      dispatch_rounds++;
+    end
+    return nxt;
+  endfunction
+
+  // -----------------------------------------------------------------------
+  // body — chạy NUM_ACTIONS hành động, KHÔNG còn @clk dư ở đầu vòng
+  // -----------------------------------------------------------------------
+  task body();
+    rob_transaction tr; int action; int act_done;
+
+    if(!uvm_config_db#(virtual rob_if.MON)::get(null,"","vif",vif))
+      `uvm_fatal("TC6","No vif")
+    begin
+      uvm_component comp = uvm_top.find("*.agt.drv");
+      if(!$cast(drv, comp)) `uvm_fatal("TC6","Driver cast failed")
+    end
+
+    // Đợi DUT đã thoát reset rồi snapshot pointer khởi tạo
+    @(posedge vif.clock);
+    pred_tail_idx = vif.mon_cb.rob_tail_idx;
+    pred_head_idx = vif.mon_cb.rob_head_idx;
+
+    `uvm_info("TC6", $sformatf("===== TC6: RANDOM (%0d ACTIONS) =====", NUM_ACTIONS), UVM_LOW)
+    `uvm_info("TC6", $sformatf("Init: pred_tail=%0d pred_head=%0d", pred_tail_idx, pred_head_idx), UVM_LOW)
+
+    act_done = 0;
+    while (act_done < NUM_ACTIONS) begin
+      // KHÔNG @(posedge vif.clock) ở đây — mỗi action tự handle clock của nó.
+      action = pick_action();
+      case(action)
+        0: do_random_dispatch();
+        1: do_random_writeback();
+        2: do_random_mispredict();
+        3: do_idle();
+      endcase
+      act_done++;
+
+      // Cross-check pointer dự đoán vs DUT, re-sync nếu lệch
+      sync_pointers_from_dut();
+    end
+
+    `uvm_info("TC6",
+      $sformatf("--- Drain phase (actions=%0d, dispatch_rounds=%0d, commit_rounds=%0d) ---",
+                act_done, dispatch_rounds, commit_rounds), UVM_LOW)
+    drain_rob();
+    `uvm_info("TC6","========== TC6 COMPLETE ==========",UVM_LOW)
+  endtask
+
+  // -----------------------------------------------------------------------
+  // Đồng bộ pointer dự đoán với giá trị thực từ DUT.
+  // Nếu lệch (do hành vi DUT mà ta chưa mô hình hết), re-sync + log.
+  // Đồng thời đếm wrap nếu nhận thấy DUT đã quay vòng.
+  // -----------------------------------------------------------------------
+  task sync_pointers_from_dut();
+    bit [6:0] dut_tail = vif.mon_cb.rob_tail_idx;
+    bit [6:0] dut_head = vif.mon_cb.rob_head_idx;
+
+    // Detect head wrap: pred_head > dut_head và không phải vừa reset
+    if (dut_head < pred_head_idx && !vif.mon_cb.flush_valid) begin
+      commit_rounds++;
+    end
+
+    if (dut_tail !== pred_tail_idx) begin
+      `uvm_info("TC6_PTR",
+        $sformatf("Tail re-sync: pred=%0d → dut=%0d", pred_tail_idx, dut_tail), UVM_HIGH)
+      pred_tail_idx = dut_tail;
+    end
+    if (dut_head !== pred_head_idx) begin
+      `uvm_info("TC6_PTR",
+        $sformatf("Head re-sync: pred=%0d → dut=%0d", pred_head_idx, dut_head), UVM_HIGH)
+      pred_head_idx = dut_head;
+    end
+  endtask
+
+  // -----------------------------------------------------------------------
+  // pick_action — giữ nguyên policy của bản gốc
+  // -----------------------------------------------------------------------
+  function int pick_action();
+    int wd=40, ww=30, wm=5, wi=25, tot, r;
+    if(!vif.mon_cb.ready) begin wd=0; ww=60; wi=35; end
+    if(dispatched_idx.size()==0) begin ww=0; wm=0; wd=70; wi=30; end
+    if(vif.mon_cb.empty) begin wm=0; ww=0; end
+    if(vif.mon_cb.commit_rollback || vif.mon_cb.flush_valid) begin wd=0;ww=0;wm=0;wi=100; end
+    if(cycle_since_last_dispatch==0) ww=0;
+    tot=wd+ww+wm+wi; if(tot==0) return 3;
+    r=$urandom_range(0,tot-1);
+    if(r<wd) return 0; if(r<wd+ww) return 1; if(r<wd+ww+wm) return 2; return 3;
+  endfunction
+
+  // -----------------------------------------------------------------------
+  // DISPATCH — đọc rob_tail_idx thực từ DUT làm gốc, đồng thời tiến
+  //            pred_tail_idx 1 row (wrap-safe).
+  // -----------------------------------------------------------------------
+  task do_random_dispatch();
+    rob_transaction tr; bit [6:0] cur_tail; int nv;
+    if(!vif.mon_cb.ready) begin do_idle(); return; end
+
+    cur_tail = vif.mon_cb.rob_tail_idx;       // GOLDEN: lấy thẳng từ DUT
+    nv       = $urandom_range(1,4);
+
+    tr = rob_transaction::type_id::create("tr");
+    start_item(tr);
+    tr.op = ROB_DISPATCH; tr.enq_partial_stall = 0;
+    for(int b=0;b<4;b++) begin
+      bit [6:0] this_idx = (cur_tail + b) % MAX_ROB_IDX; // wrap-safe
+      tr.enq_valids[b]              = (b<nv);
+      tr.enq_uops_rob_idx[b]        = this_idx;
+      tr.enq_uops_ftq_idx[b]        = 6'(ftq);
+      tr.enq_uops_pc_lob[b]         = 6'(b*4);
+      tr.enq_uops_uopc[b]           = 7'($urandom_range(0,127));
+      tr.enq_uops_pdst[b]           = 7'($urandom_range(1,127));
+      tr.enq_uops_stale_pdst[b]     = 7'($urandom_range(0,127));
+      tr.enq_uops_ldst[b]           = 6'($urandom_range(0,31));
+      tr.enq_uops_ldst_val[b]       = 1;
+      tr.enq_uops_dst_rtype[b]      = 2'b01;
+      tr.enq_uops_fp_val[b]         = 0;
+      tr.enq_uops_is_br[b]          = (b==0 && $urandom_range(0,9)==0);
+      tr.enq_uops_br_mask[b]        = tr.enq_uops_is_br[b] ? 20'h1 : 20'h0;
+      tr.enq_uops_exception[b]      = 0;
+      tr.enq_uops_exc_cause[b]      = 0;
+      tr.enq_uops_is_fence[b]       = 0;
+      tr.enq_uops_is_fencei[b]      = 0;
+      tr.enq_uops_is_unique[b]      = 0;
+      tr.enq_uops_flush_on_commit[b]= 0;
+    end
+    finish_item(tr);
+    @(posedge vif.clock);
+
+    // Ghi nhận in-flight uops bằng cur_tail (snapshot trước clock advance)
+    for(int b=0;b<nv;b++) begin
+      bit [6:0] gid = (cur_tail + b) % MAX_ROB_IDX;
+      dispatched_idx.push_back(gid);
+      dispatched_pdst[gid] = tr.enq_uops_pdst[b];
+    end
+
+    // Tiến pred_tail_idx 1 row đầy (partial_stall=0 ⇒ DUT cũng tiến 1 row)
+    pred_tail_idx = wrap_inc_row_tail(cur_tail);
+
+    ftq++; cycle_since_last_dispatch = 0;
+  endtask
+
+  // -----------------------------------------------------------------------
+  // WRITEBACK — không động vào pointer, chỉ clear busy bit ở DUT.
+  //             Pointer head sẽ tự tiến trong DUT khi điều kiện commit thoả.
+  // -----------------------------------------------------------------------
+  task do_random_writeback();
+    rob_transaction tr; int nwb, qs;
+    qs = dispatched_idx.size();
+    if(qs==0) begin do_idle(); return; end
+    nwb = $urandom_range(1, (qs<4) ? qs : 4);
+
+    tr = rob_transaction::type_id::create("tr");
+    start_item(tr);
+    tr.op = ROB_WRITEBACK;
+    for(int i=0;i<10;i++) tr.wb_valid[i]=0;
+    for(int i=0;i<nwb;i++) begin
+      int pick = $urandom_range(0, dispatched_idx.size()-1);
+      bit [6:0] idx  = dispatched_idx[pick];
+      bit [6:0] pdst = dispatched_pdst[idx];
+      if(drv.can_writeback(idx)) begin
+        tr.wb_valid[i]   = 1;
+        tr.wb_rob_idx[i] = idx;
+        tr.wb_pdst[i]    = pdst;
+      end
+      dispatched_idx.delete(pick);
+    end
+    finish_item(tr);
+    @(posedge vif.clock);
+    cycle_since_last_dispatch++;
+  endtask
+
+  // -----------------------------------------------------------------------
+  // MISPREDICT — DUT snap tail = WrapInc(GetRowIdx(br.rob_idx), NUM_ROB_ROWS).
+  //              KHÔNG về 0. Ta tính theo đúng công thức để pred_tail_idx
+  //              vẫn theo sát thực tế dù ROB đang ở giữa vòng.
+  // -----------------------------------------------------------------------
+  task do_random_mispredict();
+    rob_transaction tr;
+    if(dispatched_idx.size()==0) begin do_idle(); return; end
+    begin
+      int       pick   = $urandom_range(0, dispatched_idx.size()-1);
+      bit [6:0] br_idx = dispatched_idx[pick];
+      bit [6:0] br_row = br_idx / CW;
+      bit [6:0] new_tail_row;
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      tr.op                 = ROB_BRANCH_UPDATE;
+      tr.br_resolve_mask    = 20'h1;
+      tr.br_mispredict_mask = 20'h1;
+      tr.br_rob_idx         = br_idx;
+      tr.br_mispredict      = 1;
+      finish_item(tr);
+      @(posedge vif.clock);
+
+      // WrapInc(br_row, NUM_ROB_ROWS) * CW
+      new_tail_row = br_row + 1;
+      if (new_tail_row >= NUM_ROB_ROWS) begin
+        new_tail_row = 0;
+        dispatch_rounds++;
+      end
+      pred_tail_idx = new_tail_row * CW;
+
+      // Conservative: bỏ toàn bộ tracking — sync_pointers_from_dut() sẽ chỉnh.
+      dispatched_idx.delete();
+      cycle_since_last_dispatch++;
+    end
+    repeat($urandom_range(3,8)) do_idle();
+  endtask
+
+  // -----------------------------------------------------------------------
+  // IDLE — chỉ flush exception mới reset cả head & tail về 0
+  // -----------------------------------------------------------------------
+  task do_idle();
+    rob_transaction tr;
+    tr = rob_transaction::type_id::create("tr");
+    start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+    @(posedge vif.clock);
+    cycle_since_last_dispatch++;
+    if(vif.mon_cb.flush_valid) begin
+      `uvm_info("TC6_PTR","flush_valid → reset pred_tail/pred_head về 0",UVM_HIGH)
+      dispatched_idx.delete();
+      pred_tail_idx = 0;
+      pred_head_idx = 0;
+    end
+  endtask
+
+  // -----------------------------------------------------------------------
+  // DRAIN — gửi WB cho mọi entry còn lại; điều kiện kết thúc là empty=1
+  //         (KHÔNG đợi tail/head về 0 vì điều đó chỉ xảy ra khi flush).
+  // -----------------------------------------------------------------------
+  task drain_rob();
+    rob_transaction tr; int att = 0;
+    while(dispatched_idx.size() > 0 && att < 100) begin
+      int nwb = (dispatched_idx.size()<10) ? dispatched_idx.size() : 10;
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      tr.op = ROB_WRITEBACK;
+      for(int i=0;i<10;i++) tr.wb_valid[i]=0;
+      for(int i=0; i<nwb && dispatched_idx.size()>0; i++) begin
+        bit [6:0] idx = dispatched_idx[0];
+        if(drv.can_writeback(idx)) begin
+          tr.wb_valid[i]   = 1;
+          tr.wb_rob_idx[i] = idx;
+          tr.wb_pdst[i]    = dispatched_pdst[idx];
+        end
+        dispatched_idx.delete(0);
+      end
+      finish_item(tr);
+      @(posedge vif.clock);
+      att++;
+    end
+    repeat(60) begin
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+      @(posedge vif.clock);
+      sync_pointers_from_dut();
+      if(vif.mon_cb.empty) begin
+        `uvm_info("TC6",
+          $sformatf("Drain: empty=1. Final tail=%0d head=%0d (≠0 là HỢP LỆ theo spec ROB)",
+                    vif.mon_cb.rob_tail_idx, vif.mon_cb.rob_head_idx),
+          UVM_LOW)
+        return;
+      end
+    end
+    if(!vif.mon_cb.empty) `uvm_warning("TC6","ROB not empty after drain")
+  endtask
+endclass
